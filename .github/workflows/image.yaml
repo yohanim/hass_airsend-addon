@@ -1,0 +1,58 @@
+name: Image
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  standalone:
+    name: Standalone image (${{ matrix.platform }})
+    runs-on: ${{ matrix.platform == 'linux/arm64' && 'ubuntu-24.04-arm' || 'ubuntu-latest' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: [linux/amd64, linux/arm64]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Build without any build argument (like docker compose / Dockhand)
+        uses: docker/build-push-action@v6
+        with:
+          context: addons/airsend
+          platforms: ${{ matrix.platform }}
+          load: true
+          tags: airsend:test
+      - name: Image content
+        run: |
+          docker run --rm --entrypoint sh airsend:test -c '
+            set -e
+            command -v bashio php nginx
+            php -v | head -n1
+            php -m | grep -qi curl && echo "php curl: ok"
+            test -x /usr/bin/with-contenv && echo "with-contenv: ok"
+            arch="$(apk --print-arch)"; case "$arch" in aarch64) arch=arm64;; esac
+            ls -l "/home/bin/unix/$arch/AirSendWebService"
+            test -f /home/hass_cb.php && test -f /home/hassapi.class.php
+          '
+      - name: Start in standalone mode and answer on 33863
+        run: |
+          docker run -d --name airsend -e HTTPS=0 -p 33863:33863 airsend:test
+          for i in $(seq 1 30); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:33863/ || true)
+            if [ "$code" != "000" ]; then echo "AirSendWebService answered HTTP $code"; break; fi
+            sleep 1
+          done
+          docker logs airsend
+          [ "$code" != "000" ]
+      - name: HTTPS mode (nginx, self-signed)
+        run: |
+          docker rm -f airsend
+          docker run -d --name airsend -e HTTPS=1 -p 33863:33863 airsend:test
+          for i in $(seq 1 30); do
+            code=$(curl -sk -o /dev/null -w '%{http_code}' https://127.0.0.1:33863/ || true)
+            if [ "$code" != "000" ]; then echo "nginx answered HTTP $code"; break; fi
+            sleep 1
+          done
+          docker logs airsend
+          [ "$code" != "000" ]

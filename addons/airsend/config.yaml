@@ -4,12 +4,11 @@ version: "1.3"
 slug: "airsend"
 url: https://github.com/devmel/hass_airsend-addon
 codenotary: notary@home-assistant.io
+# Home Assistant no longer supports 32-bit systems: its base images for
+# armhf, armv7 and i386 stop at Alpine 3.22.
 arch:
   - aarch64
   - amd64
-  - armhf
-  - armv7
-  - i386
 homeassistant_api: true
 startup: services
 init: false
