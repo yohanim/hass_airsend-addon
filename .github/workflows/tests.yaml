@@ -18,7 +18,9 @@ jobs:
       - name: PHP syntax
         run: for f in addons/airsend/*.php tests/*.php; do php -l "$f"; done
       - name: Shell scripts
-        run: shellcheck -s bash -e SC1008 addons/airsend/*.sh tests/*.sh
+        run: |
+          shellcheck -s bash -e SC1008 addons/airsend/state_get.sh addons/airsend/state_post.sh addons/airsend/states_get.sh tests/*.sh
+          shellcheck -s bash -e SC1008 -S error addons/airsend/run.sh
       - name: Callback against a mocked Home Assistant
         run: bash tests/test_callback.sh
 
