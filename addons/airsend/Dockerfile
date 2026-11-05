@@ -11,9 +11,11 @@ COPY nginx.conf /etc/nginx/nginx.conf
 COPY hassapi.class.php /home
 COPY hass_cb.php /home
 COPY state_post.sh /home
+COPY state_get.sh /home
 COPY states_get.sh /home
 COPY run.sh /
 RUN chmod a+x /home/state_post.sh
+RUN chmod a+x /home/state_get.sh
 RUN chmod a+x /home/states_get.sh
 RUN chmod a+x /run.sh
 

@@ -1,29 +1,52 @@
 <?php
 
+/*
+ * Home Assistant REST API helper used by the AirSend callback (hass_cb.php).
+ *
+ * The callback runs once per AirSend event. To stay cheap on large Home
+ * Assistant installations it no longer decodes and hashes the whole state
+ * machine on every event:
+ *  - a compact index (states_index.json) is built from GET /api/states at
+ *    most every INDEX_TTL seconds. It maps the 12 hex digits uid used by the
+ *    integration (sha256 of the entity_id) to the entity_id, and keeps only
+ *    the entities carrying an AirSend "channel" attribute for channel lookups;
+ *  - the state of an entity about to be updated is read live with
+ *    GET /api/states/<entity_id>, so it is always fresh and the whole state
+ *    machine no longer has to be re-downloaded after toggle/data events.
+ */
 class HassAPI{
-	var $states = null;
-	
-    function __construct($BASE_HASS_API, $HASS_API_TOKEN, $auto_include = false) {
+	const INDEX_TTL = 100;
+	const STATES_FILE = 'states.json';
+	const INDEX_FILE = 'states_index.json';
+	const INDEX_VERSION = 1;
+
+	var $index = null;
+
+	function __construct($BASE_HASS_API, $HASS_API_TOKEN, $auto_include = false) {
 		$this->BASE_HASS_API = $BASE_HASS_API;
 		$this->HASS_API_TOKEN = $HASS_API_TOKEN;
 		$this->auto_include = $auto_include;
-    }
+	}
 
 	public function isAuthorized() {
-        if(!empty($this->BASE_HASS_API) && !empty($this->HASS_API_TOKEN)){
-            return true;
-        }
-        return false;
+		if(!empty($this->BASE_HASS_API) && !empty($this->HASS_API_TOKEN)){
+			return true;
+		}
+		return false;
 	}
 	public function isAutoInclude() {
-        return $this->auto_include;
+		return $this->auto_include;
 	}
+
+	public static function uidOf($entity_id) {
+		return intval(str_split(hash('sha256', $entity_id), 12)[0], 16);
+	}
+
 	function searchEntityId($uid) {
-		if($this->loadStates()){
-			foreach ($this->states as $value) {
-				if($value['entity_uid_sha256'] == $uid){
-					return $value['entity_id'];
-				}
+		if($this->loadIndex()){
+			$key = (string)intval($uid, 0);
+			if(array_key_exists($key, $this->index['uids'])){
+				return $this->index['uids'][$key];
 			}
 		}
 		return null;
@@ -31,28 +54,26 @@ class HassAPI{
 
 	function searchEntitiesFromChannelAndType($channel, $type) {
 		$ret = array();
-		if(isset($channel) && $this->loadStates()){
-			foreach ($this->states as $value) {
-				if(array_key_exists('attributes', $value) && array_key_exists('channel', $value['attributes'])){
-					if(self::isChannelCompatible($channel, $value['attributes']['channel'])){
-						$foundid = false;
-						$entity_id = $value['entity_id'];
-						//Sensors
-						$is_sensor = (stripos($entity_id, "sensor.") !== false) ? true : false;
-						if($is_sensor && array_key_exists('device_class', $value['attributes'])){
-							$dclass = $value['attributes']['device_class'];
-							$dclass = str_replace('humidity', 'r_humidity', $dclass);
-							if($dclass == $type){
-								$foundid = true;
-							}
-						}
-						//Others
-						if($type == 'level' || $type == 'state' || $type == 'toggle' || $type == 'data'){
+		if(isset($channel) && $this->loadIndex()){
+			foreach ($this->index['channels'] as $value) {
+				if(self::isChannelCompatible($channel, $value['channel'])){
+					$foundid = false;
+					$entity_id = $value['entity_id'];
+					//Sensors
+					$is_sensor = (stripos($entity_id, "sensor.") !== false) ? true : false;
+					if($is_sensor && isset($value['device_class'])){
+						$dclass = $value['device_class'];
+						$dclass = str_replace('humidity', 'r_humidity', $dclass);
+						if($dclass == $type){
 							$foundid = true;
 						}
-						if($foundid){
-							$ret[] = $entity_id;
-						}
+					}
+					//Others
+					if($type == 'level' || $type == 'state' || $type == 'toggle' || $type == 'data'){
+						$foundid = true;
+					}
+					if($foundid){
+						$ret[] = $entity_id;
 					}
 				}
 			}
@@ -61,7 +82,7 @@ class HassAPI{
 	}
 
 	function setState($entity_id, $type, $state, $timestamp_ms, $channel = null) {
-		$reloadcache = false;
+		$new_entity = false;
 		$attributes = null;
 		if(isset($channel) && ((int)$channel["id"]) == 1){
 			if($type === 'data'){
@@ -69,7 +90,7 @@ class HassAPI{
 			}
 		}
 		if($entity_id == null && isset($channel)){
-			$reloadcache = true;
+			$new_entity = true;
 			//New entity
 			$entity_id = "sensor.".self::toUniqueChannelName($channel);
 			$attributes = array('channel' => $channel);
@@ -95,6 +116,9 @@ class HassAPI{
 			$content = array('attributes' => $attributes);
 		}
 		if($content != null){
+			if(!isset($content['attributes']) || !is_array($content['attributes'])){
+				$content['attributes'] = array();
+			}
 			if($attributes != null){
 				$content['attributes'] = array_merge($content['attributes'], $attributes);
 			}
@@ -106,13 +130,11 @@ class HassAPI{
 				if(array_key_exists('state', $content) && $content['state'] == $state){
 					$state .= '+';
 				}
-				$reloadcache = true;
 			}
 			if($type === 'toggle'){
 				if(array_key_exists('state', $content) && $content['state'] == 'pressed'){
 					$state .= '+';
 				}
-				$reloadcache = true;
 			}
 			if($type === 'level'){
 				$is_cover = (stripos($entity_id, "cover.") !== false) ? true : false;
@@ -126,30 +148,47 @@ class HassAPI{
 			}
 			$content['state'] = $state;
 			if($current_position !== null){
-				if(array_key_exists('attributes', $content) && array_key_exists('supported_features', $content['attributes']) && ($content['attributes']['supported_features']&0x4) == 0x4){
+				if(array_key_exists('supported_features', $content['attributes']) && ($content['attributes']['supported_features']&0x4) == 0x4){
 					$content['attributes']['current_position'] = $current_position;
 				}
 			}
-			unset($content['entity_uid_sha256']);
-			unset($content['last_changed']);
-			unset($content['last_updated']);
-			//$dti = DateTimeImmutable::createFromFormat('U.u', ($timestamp_ms/1000));
-			//$content['last_updated'] = $dti->format('Y-m-d').'T'.$dti->format('H:i:s').'+00:00';
-			$this->state_post($entity_id, $content, $reloadcache);
+			$post = array('state' => $content['state'], 'attributes' => $content['attributes']);
+			$this->state_post($entity_id, $post);
+			if($new_entity){
+				// A new sensor appeared: let the next event find it by channel
+				$this->invalidateIndex();
+			}
 			return true;
 		}
 		return false;
 	}
 
+	/** Read one entity state live (always fresh). */
 	function getState($entity_id){
-		if($this->loadStates() && isset($entity_id)){
-			foreach ($this->states as $value) {
-				if($value['entity_id'] == $entity_id){
-					return $value;
-				}
-			}
+		if(!$this->isAuthorized() || !isset($entity_id) || !self::isValidEntityId($entity_id)){
+			return null;
 		}
-		return null;
+		if($this->isSupervisor()){
+			//Bug in supervisor proxy => use bash
+			$output = array();
+			exec('./state_get.sh '.escapeshellarg($entity_id), $output, $retval);
+			$data = implode("\n", $output);
+		}else{
+			$res = HassAPI::request($this->BASE_HASS_API."/states/".$entity_id, null, 'GET', $this->HASS_API_TOKEN);
+			$data = ($res !== false && isset($res['info']['http_code']) && $res['info']['http_code'] == 200) ? $res['data'] : null;
+		}
+		if(empty($data)){
+			return null;
+		}
+		$value = json_decode($data, true);
+		if(!is_array($value) || !isset($value['entity_id'])){
+			return null;
+		}
+		return $value;
+	}
+
+	public static function isValidEntityId($entity_id){
+		return is_string($entity_id) && preg_match('/^[a-z0-9_]+\.[a-z0-9_]+$/', $entity_id) === 1;
 	}
 
 	public static function extractHostAndPort($input, $default_port = 8123){
@@ -233,7 +272,7 @@ class HassAPI{
 					$svalue = intval($ovalue);
 				}
 				if($stype != null){
-					$ret[] = array($stype, $svalue); 
+					$ret[] = array($stype, $svalue);
 				}
 			}
 		}
@@ -242,7 +281,7 @@ class HassAPI{
 
 	public static function isChannelCompatible($obj1, $obj2){
         $result = false;
-        if(isset($obj1) && isset($obj2)){
+        if(isset($obj1) && isset($obj2) && is_array($obj1) && is_array($obj2)){
             $ch1 = self::toBasicChannel($obj1);
             $ch2 = self::toBasicChannel($obj2);
             $result = ($ch1 == $ch2);
@@ -275,61 +314,93 @@ class HassAPI{
         return $result;
     }
 
-	private function state_post($entity_id, $content, $reloadcache = false){
+	/** Build the compact index from a decoded GET /api/states response. */
+	public static function buildIndex($states){
+		$index = array('version' => self::INDEX_VERSION, 'uids' => array(), 'channels' => array());
+		if(!is_array($states)){
+			return $index;
+		}
+		foreach ($states as $value) {
+			if(!isset($value['entity_id'])){
+				continue;
+			}
+			$entity_id = $value['entity_id'];
+			$index['uids'][(string)self::uidOf($entity_id)] = $entity_id;
+			if(isset($value['attributes']['channel']) && is_array($value['attributes']['channel'])){
+				$entry = array('entity_id' => $entity_id, 'channel' => $value['attributes']['channel']);
+				if(isset($value['attributes']['device_class'])){
+					$entry['device_class'] = $value['attributes']['device_class'];
+				}
+				$index['channels'][] = $entry;
+			}
+		}
+		return $index;
+	}
+
+	private function isSupervisor(){
+		return strpos($this->BASE_HASS_API, "supervisor") !== false;
+	}
+
+	private function state_post($entity_id, $content){
+		if(!self::isValidEntityId($entity_id)){
+			trigger_error("state_post: invalid entity_id ".$entity_id, E_USER_WARNING);
+			return;
+		}
 		$json = json_encode($content, JSON_FORCE_OBJECT);
-		if(strpos($this->BASE_HASS_API, "supervisor") !== false){
+		if($this->isSupervisor()){
 			//Bug in supervisor proxy => use bash
-			exec('./state_post.sh "'.$entity_id.'" "'.base64_encode($json).'"', $output, $retval);
+			exec('./state_post.sh '.escapeshellarg($entity_id).' '.escapeshellarg(base64_encode($json)), $output, $retval);
 		}else{
 			$res = HassAPI::request($this->BASE_HASS_API."/states/".$entity_id, $json, 'POST', $this->HASS_API_TOKEN);
 		}
-		trigger_error("state_post ".$reloadcache." : ".$entity_id." ".$content['state'], E_USER_NOTICE);
-		if($reloadcache){
-			$this->states_get_cache();
-		}
+		trigger_error("state_post : ".$entity_id." ".$content['state'], E_USER_NOTICE);
 	}
+
+	/** Download all states (only to rebuild the index) into states.json. */
 	private function states_get_cache(){
-		if(strpos($this->BASE_HASS_API, "supervisor") !== false){
+		if($this->isSupervisor()){
 			//Bug in supervisor proxy => use bash
 			exec('./states_get.sh', $output, $retval);
 		}else{
 			$res = HassAPI::request($this->BASE_HASS_API."/states", null, 'GET', $this->HASS_API_TOKEN);
 			if($res !== false && isset($res) && is_array($res) && isset($res['data'])){
-				file_put_contents("states.json", $res['data']);
+				file_put_contents(self::STATES_FILE, $res['data']);
 			}
 		}
 	}
 
-	private function loadStates() {
-		$ret = false;
-		if($this->states){
-			$ret = true;
-		}else{
-			if($this->isAuthorized()){
-				$loaded = false;
-				$data_age = @(time() - filemtime('states.json'));
-				if($data_age > 100){
-					$this->states_get_cache();
-				}
-				$data = @file_get_contents('states.json');
-				if(isset($data)){
-					$this->states = json_decode($data, true);
-					if($this->states){
-						foreach ($this->states as &$value) {
-							$h = str_split(hash('sha256', $value['entity_id']),12)[0];
-							$val = intval($h, 16);
-							$value['entity_uid_sha256'] = $val;
-						}
-						$loaded = true;
-						$ret = true;
-					}
-				}
-				if($loaded == false){
-					trigger_error("API GET states wrong response", E_USER_ERROR);
-				}
+	private function invalidateIndex(){
+		$this->index = null;
+		@unlink(self::INDEX_FILE);
+	}
+
+	private function loadIndex() {
+		if($this->index !== null){
+			return true;
+		}
+		if(!$this->isAuthorized()){
+			return false;
+		}
+		clearstatcache();
+		$index_age = @(time() - filemtime(self::INDEX_FILE));
+		if(file_exists(self::INDEX_FILE) && $index_age <= self::INDEX_TTL){
+			$index = json_decode(@file_get_contents(self::INDEX_FILE), true);
+			if(is_array($index) && isset($index['version']) && $index['version'] == self::INDEX_VERSION){
+				$this->index = $index;
+				return true;
 			}
 		}
-		return $ret;
+		// Rebuild: one full download and decode, at most every INDEX_TTL seconds
+		$this->states_get_cache();
+		$states = json_decode(@file_get_contents(self::STATES_FILE), true);
+		@unlink(self::STATES_FILE);
+		if(!is_array($states)){
+			trigger_error("API GET states wrong response", E_USER_WARNING);
+			return false;
+		}
+		$this->index = self::buildIndex($states);
+		file_put_contents(self::INDEX_FILE, json_encode($this->index));
+		return true;
 	}
 
     private static function request($url, $data = null, $method = 'GET', $token = null) {
@@ -339,6 +410,8 @@ class HassAPI{
 			curl_setopt($curl, CURLOPT_URL, $url);
 			curl_setopt($curl, CURLOPT_AUTOREFERER, true);
 			curl_setopt($curl, CURLOPT_RETURNTRANSFER, true);
+			curl_setopt($curl, CURLOPT_CONNECTTIMEOUT, 5);
+			curl_setopt($curl, CURLOPT_TIMEOUT, 15);
 			if (preg_match('~^(?:DELETE|GET|POST|PUT)$~i', $method) > 0){
 				if (preg_match('~^(?:POST|PUT)$~i', $method) > 0){
 					if (is_array($data) === true){

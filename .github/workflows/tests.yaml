@@ -1,0 +1,41 @@
+name: Tests
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  callback:
+    name: PHP callback
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: "8.4"
+          extensions: curl
+      - name: PHP syntax
+        run: for f in addons/airsend/*.php tests/*.php; do php -l "$f"; done
+      - name: Shell scripts
+        run: shellcheck -s bash -e SC1008 addons/airsend/*.sh tests/*.sh
+      - name: Callback against a mocked Home Assistant
+        run: bash tests/test_callback.sh
+
+  build:
+    name: Docker image (${{ matrix.arch }})
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        arch: [amd64, aarch64]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - name: Build
+        uses: docker/build-push-action@v6
+        with:
+          context: addons/airsend
+          platforms: ${{ matrix.arch == 'amd64' && 'linux/amd64' || 'linux/arm64' }}
+          build-args: BUILD_FROM=ghcr.io/home-assistant/${{ matrix.arch }}-base:3.22
+          push: false
