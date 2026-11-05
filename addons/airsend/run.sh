@@ -1,6 +1,6 @@
 #!/usr/bin/with-contenv bashio
 
-cd /home
+cd /home || exit 1
 arch="$(apk --print-arch)"
 case "$arch" in \
 		aarch64) arch='arm64' ;; \
@@ -17,20 +17,20 @@ if [ -n "${SUPERVISOR_TOKEN:-}" ]
 then
 	hname="$(hostname -i)"
 	echo "internal_url: http://${hname}:33863/"
-	echo $(bashio::config 'auto_include') > auto_include.cfg
+	bashio::config 'auto_include' > auto_include.cfg
 	# Start AirSendWebService
-	./bin/unix/${arch}/AirSendWebService 99399
+	"./bin/unix/${arch}/AirSendWebService" 99399
 	# Start hass callback service
 	php -S 127.0.0.1:80 hass_cb.php & CALLBACK_PID=$!
 elif [ -n "${HASS_HOST:-}" ] && [ -n "${HASS_TOKEN:-}" ]
 then
 	# Start AirSendWebService
 	if [ "${HTTPS:-0}" -eq 1 ]; then
-		./bin/unix/${arch}/AirSendWebService 33864
+		"./bin/unix/${arch}/AirSendWebService" 33864
 		nginx
 		echo "internal_url: https://{YOUR_DOCKER_MACHINE_IP}:33863/"
 	else
-		./bin/unix/${arch}/AirSendWebService 99399
+		"./bin/unix/${arch}/AirSendWebService" 99399
 		echo "internal_url: http://{YOUR_DOCKER_MACHINE_IP}:33863/"
 	fi
 	# Start hass callback service
@@ -38,11 +38,11 @@ then
 else
 	# Start AirSendWebService
 	if [ "${HTTPS:-0}" -eq 1 ]; then
-		./bin/unix/${arch}/AirSendWebService 33864
+		"./bin/unix/${arch}/AirSendWebService" 33864
 		nginx
 		echo "example: curl -k https://{YOUR_DOCKER_MACHINE_IP}:33863/"
 	else
-		./bin/unix/${arch}/AirSendWebService 99399
+		"./bin/unix/${arch}/AirSendWebService" 99399
 		echo "example: curl http://{YOUR_DOCKER_MACHINE_IP}:33863/"
 	fi
 	echo "Running the AirSendWebService only..."
@@ -69,7 +69,7 @@ while true; do
     fi
 done
 
-kill $ASW_PID 2>/dev/null || true
-kill $CALLBACK_PID 2>/dev/null || true
+kill "$ASW_PID" 2>/dev/null || true
+kill "$CALLBACK_PID" 2>/dev/null || true
 echo "exiting..."
 exit 1
